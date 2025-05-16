@@ -1,0 +1,498 @@
+// Comparison of HYDRAFloods SAR (Sentinel-1) Otsu thresholding methods
+
+// NOTES:
+/*
+method 1: canny edges with preliminary water
+method 2: Bmax polygons with preliminary water
+method 3: combination
+
+- made sure all methods use the same input image, with:
+  - negative buffer (commented out for now, as recent imagery does not seem to have border noise?)
+  - smoothing
+  - clipped to country boundaries (to remove data over sea/ocean)
+    -> could use a better geometry, current version is quite 'coarse' (e.g. removing tidal inlets)
+  - mosaic of chosen band
+- this uses predefined test sets (combination of date and location),
+  if you want to make your own, either add to the set or set hardcoded (see lines 98-128)
+- HAND and/or maximum allowed threshold not used yet, as the idea is to compare methods without 'fixes'
+- Bmax methods time out when using stack of multiple images...
+  increasing the gridSize (e.g. 0.5, factor 10) works...but how good is it then? (test 3 then gives only 1 Bmax polygon)
+- added an option with test sets to remove a certain orbit pass, to make sure only one is used
+  (required when using entire stack of one day, which can contain both ascending and descending)
+  ...could be coded better, but works well for now
+*/
+
+// TO-DO:
+/*
+- create a separate HYDRAFloods module folder, for shorter and easier to read script?
+*/
+
+// ----------------------------------------------------------------------------------------- //
+// Parameters
+// ----------------------------------------------------------------------------------------- //
+
+// test case
+/*
+1: 2019-06-15, Ayeryawaddy River, central
+2: 2019-06-15, Ayeryawaddy delta
+3: 2019-06-15, full stack (9 images), covering mountains to coast in central Myanmar
+4: 2019-07-06, Ayeryawaddy River, north, near Myitkyina
+5: 2019-07-11, Ayeryawaddy River, north, near Myitkyina
+6: 2019-07-11, eastern mountains, little to no water present
+7: 2015-08-28, western coastal area
+8: 2015-08-28, full stack (6 images), covering mountains to coast in the west
+9: 2015-08-11, Kale floods
+10: 2015-08-11, full stack (7 images), covering mountains to coast in central Myanmar during flood conditions
+*/
+var test_case = 7;
+
+// negative buffer
+var neg_buffer = -1500;
+
+// threshold for preliminary water
+// var initThresh = -14;
+var initThresh = 10////-16;
+// var initThresh = -18;
+
+// maximum allowed threshold
+var maxThresh = 200//-12;
+
+// parameters for all methods
+var band           = "b1" //'VV';
+var smoothing      = 100;
+var reductionScale = 90;
+var maxBuckets     = 255;
+var minBucketWidth = 0.01;
+var maxRaw         = 1e6;
+
+// method 1
+var method_1_name    = 'canny edges';
+var connected_pixels = 200;
+var edge_length      = 100;
+var smooth_edges     = 300;
+var canny_threshold  = 1;
+var canny_sigma      = 1;
+var canny_lt         = 0.05;
+
+// method 2
+var method_2_name = 'Bmax';
+var gridSize      = 0.05;  // for single image?
+// var gridSize      = 0.5;  // for multiple images?
+var m1_val        = -20;
+var m2_val        = -5;
+var bmax_thresh   = 0.75; // 0.5 gives more polygons where you would expect them, but perhaps slows it down?
+var maxN          = 100;  // lower value, e.g. 20 might perhaps be faster?
+var tileScale     = 16;
+
+// method 3
+var method_3_name = 'Bmax + canny';
+
+// visual parameters
+var visParams_S1    = {min:-30, max:0};
+var visParams_water = {min:0, max:1, palette:['white','blue']};
+
+// ----------------------------------------------------------------------------------------- //
+// Preprocessing
+// ----------------------------------------------------------------------------------------- //
+
+// // dates
+// var date_1 = '2019-06-15'; // date used by Tim (1)
+// var date_2 = '2019-07-06'; // date used by Tim (2)s
+// var date_3 = '2019-07-11'; // date used by Tim (3)
+// var date_4 = '2015-08-28'; // date used by Willem
+// var date_5 = '2015-08-11'; // Kale floods
+
+
+// dates
+var date_1 = '2019-07-16'; // 
+var date_2 = '2019-07-18'; // 
+var date_3 = '2019-07-21'; // 
+var date_4 = '2015-07-28'; // 
+var date_5 = '2015-08-02'; // 
+
+
+// // test location
+// var test_point_1 = [94.898263, 20.187962];
+// var test_point_2 = [95.238839, 16.086579];
+// var test_point_3 = [97.392159, 25.362507];
+// var test_point_4 = [98.845000, 22.418000];
+// var test_point_5 = [92.974000, 20.205000];
+// var test_point_6 = [94.080800, 23.198500];
+
+// Myanmar bounds
+var Myanmar = countries.filter(ee.Filter.eq('country_co', 'ID'));
+Map.addLayer(Myanmar, {}, "Panama")
+// var test_sets = {
+//   1:  {'date': date_1, 'geom': ee.Geometry.Point(test_point_1), 'orbit_neq': ''},
+//   2:  {'date': date_1, 'geom': ee.Geometry.Point(test_point_2), 'orbit_neq': ''},
+//   3:  {'date': date_1, 'geom': Myanmar.geometry(), 'orbit_neq': 'DESCENDING'},
+//   4:  {'date': date_2, 'geom': ee.Geometry.Point(test_point_3), 'orbit_neq': ''},
+//   5:  {'date': date_3, 'geom': ee.Geometry.Point(test_point_3), 'orbit_neq': ''},
+//   6:  {'date': date_3, 'geom': ee.Geometry.Point(test_point_4), 'orbit_neq': ''},
+//   7:  {'date': date_4, 'geom': ee.Geometry.Point(test_point_5), 'orbit_neq': ''},
+//   8:  {'date': date_4, 'geom': Myanmar.geometry(), 'orbit_neq': ''},
+//   9:  {'date': date_5, 'geom': ee.Geometry.Point(test_point_6), 'orbit_neq': ''},
+//   10: {'date': date_5, 'geom': Myanmar.geometry(), 'orbit_neq': ''},
+// };
+
+// // test set
+// var date       = test_sets[test_case]['date'];
+// var test_point = test_sets[test_case]['geom'];
+// var orbit_neq  = test_sets[test_case]['orbit_neq'];
+// print('date:', date);
+
+// filter S1 collection
+
+// var ICEYE = ee.Image('projects/servir-sco-assets/assets/ICEYE_Export2')
+
+var Capella = ee.Image('projects/servir-sco-assets/assets/CAPELLA')
+
+var Umbra = ee.Image('users/jca0030/UMBRA_Sample')
+// var S1 =  ee.ImageCollection("COPERNICUS/S1_GRD")
+var S1 = Umbra
+Map.addLayer(S1, {}, "Capella")
+print("Capella", Capella)
+
+// S1 = S1.filterBounds(Myanmar.geometry())
+S1 = S1.clip(Myanmar.geometry())
+      // .filterDate(date_1, ee.Date(date_1).advance(1,'day'))
+       //.filter(ee.Filter.neq('orbitProperties_pass', orbit_neq));
+// print('S1 images (full stack):', S1.size());
+Map.addLayer(S1.select(band), visParams_S1, 'S1 (raw, full stack)', false);
+
+S1 = S1.clip(Myanmar);
+// print('S1 images (current analysis):', S1.size());
+Map.addLayer(S1.select(band), visParams_S1, 'S1 (raw)', true);
+
+// apply negative buffer to remove border noise
+// S1 = S1.map(function(img) {
+//   return img.clip(img.geometry().buffer(neg_buffer));
+// });
+// Map.addLayer(S1.select(band), visParams_S1, 'S1 (neg. buffer)', false);
+
+// // apply smoothing
+// S1 = S1.map(function(img) {
+//   var temp_band = img.select(band).focal_median(smoothing, 'circle', 'meters');
+//   return ee.Image.cat(img.select('angle'), temp_band);
+// });
+// Map.addLayer(S1.select(band), visParams_S1, 'S1 (smoothed)', false);
+
+// // clip to borders
+// S1 = S1.map(function(img) {
+//   return img.clip(Myanmar.geometry());
+// });
+// Map.addLayer(S1.select(band), visParams_S1, 'S1 (clipped)', false);
+
+// get mosaic for target date
+// var S1_img = S1.qualityMosaic(band).select(band).set('system:footprint', S1.geometry());
+// Map.addLayer(S1_img, visParams_S1, 'S1 mosaic (' + band + ')', false);
+
+var S1_img = S1
+
+// ----------------------------------------------------------------------------------------- //
+// Functions
+// ----------------------------------------------------------------------------------------- //
+
+function showHist(histogram, threshold, sub_title) {
+  // get histogram values and buckets
+  var hist_values  = ee.List(histogram.get('histogram'));
+  var hist_buckets = ee.List(histogram.get('bucketMeans'));
+  // construct array for visualization of threshold in chart
+  var threshold_array = ee.List.repeat(0, hist_values.size());
+  var max_frequency   = ee.Number(hist_values.reduce(ee.Reducer.max()));
+  var thresh_index    = hist_buckets.indexOf(threshold);
+  threshold_array     = threshold_array.set(thresh_index, max_frequency.multiply(1.0));
+  var hist_chart = ui.Chart.array.values(ee.Array.cat([hist_values, threshold_array], 1), 0, hist_buckets);
+  hist_chart.setSeriesNames(['values', 'threshold']);
+  hist_chart.setOptions({
+    title: 'Histogram for Otsu (' + sub_title + ')',
+    hAxis: {title: band + ' value'},
+    vAxis: {title: 'Frequency'},
+  });
+  hist_chart.setChartType('ScatterChart');
+  hist_chart.setChartType('ColumnChart');
+  print(hist_chart);
+}
+
+function otsu(histogram) {
+  // make sure histogram is an ee.Dictionary object
+  histogram = ee.Dictionary(histogram);
+  // extract relevant values into arrays
+  var counts = ee.Array(histogram.get('histogram'));
+  var means  = ee.Array(histogram.get('bucketMeans'));
+  // calculate single statistics over arrays
+  var size  = means.length().get([0]);
+  var total = counts.reduce(ee.Reducer.sum(), [0]).get([0]);
+  var sum   = means.multiply(counts).reduce(ee.Reducer.sum(), [0]).get([0]);
+  var mean  = sum.divide(total);
+  // compute between sum of squares, where each mean partitions the data
+  var indices = ee.List.sequence(1, size);
+  var bss     = indices.map(function(i) {
+    var aCounts = counts.slice(0, 0, i);
+    var aCount  = aCounts.reduce(ee.Reducer.sum(), [0]).get([0]);
+    var aMeans  = means.slice(0, 0, i);
+    var aMean   = aMeans.multiply(aCounts)
+      .reduce(ee.Reducer.sum(), [0]).get([0])
+      .divide(aCount);
+    var bCount = total.subtract(aCount);
+    var bMean  = sum.subtract(aCount.multiply(aMean)).divide(bCount);
+    return aCount.multiply(aMean.subtract(mean).pow(2)).add(
+        bCount.multiply(bMean.subtract(mean).pow(2)));
+  });
+  // return the mean value corresponding to the maximum BSS
+  return means.sort(bss).get([-1]);
+}
+
+function globalOtsu(img) {
+  // get preliminary water
+  var binary = img.lt(initThresh).rename('binary');
+  Map.addLayer(binary, visParams_water, 'preliminary water (' + band + ' < ' + initThresh + ')', false);
+  // get canny edges
+  var canny = ee.Algorithms.CannyEdgeDetector(binary, canny_threshold, canny_sigma);
+  Map.addLayer(canny, {}, 'canny edges', false);
+  // process canny edges
+  var connected  = canny.updateMask(canny).lt(canny_lt).connectedPixelCount(connected_pixels, true);
+  var edges      = connected.gte(edge_length);
+  edges          = edges.updateMask(edges);
+  var edgeBuffer = edges.focal_max(smooth_edges, 'square', 'meters');
+  Map.addLayer(connected, {}, 'connected edges', false);
+  Map.addLayer(edges, {palette:'yellow'}, 'edges > length ' + edge_length, false);
+  Map.addLayer(edgeBuffer, {}, 'buffered edges', false);
+  // get histogram for Otsu
+  var histogram_image = img.updateMask(edgeBuffer);
+  Map.addLayer(histogram_image, {}, 'histogram image (' + band + ')', false);
+  var histogram = ee.Dictionary(histogram_image.reduceRegion({
+    // reducer: ee.Reducer.histogram(maxBuckets, 2),
+    // reducer: ee.Reducer.histogram(maxBuckets, minBucketWidth, maxRaw),
+    reducer: ee.Reducer.histogram(maxBuckets),
+    scale: reductionScale,
+    bestEffort: true,
+    maxPixels: 1e12,
+    // tileScale: tileScale
+  }).get(band));
+  var threshold = otsu(histogram);
+  showHist(histogram, threshold, method_1_name);
+  print('calculated threshold (' + method_1_name + '):', threshold);
+  return threshold;
+}
+
+function createGridOnImg(img) {
+  // get coordinates from image
+  var geom   = img.geometry();
+  var bounds = geom.bounds();
+  var coords = ee.List(bounds.coordinates().get(0));
+  // get parameters for grid construction
+  gridSize = ee.Number(gridSize);
+  var west = ee.Number(ee.List(coords.get(0)).get(0)),
+      south = ee.Number(ee.List(coords.get(0)).get(1)),
+      east = ee.Number(ee.List(coords.get(2)).get(0)),
+      north = ee.Number(ee.List(coords.get(2)).get(1));
+  west  = west.subtract(west.mod(gridSize));
+  south = south.subtract(south.mod(gridSize));
+  east  = east.add(gridSize.subtract(east.mod(gridSize)));
+  north = north.add(gridSize.subtract(north.mod(gridSize)));
+  // construct grid
+  var grid = ee.FeatureCollection(
+    ee.List.sequence(south, north.subtract(gridSize), gridSize).map(function(i){
+      i = ee.Number(i);
+      var out = ee.List.sequence(west, east.subtract(gridSize), gridSize).map(function(j){
+        j = ee.Number(j);
+        var box = ee.Feature(ee.Geometry.Rectangle(j, i, j.add(gridSize), i.add(gridSize)));
+        var out = ee.Algorithms.If(geom.contains(box.geometry()), box, null);
+        return ee.Feature(out);
+      });
+      return out;
+    }).flatten()
+  );
+  Map.addLayer(grid, {}, 'grid', false);
+  // print('grid cells:', grid.size());
+  return grid;
+}
+
+function BmaxPolygons(img) {
+  // create grid on image
+  var grid = createGridOnImg(img);
+  // get preliminary water
+  var temp_water = img.select(band).lt(initThresh);
+  // get Bmax polygons from grid
+  var bmax = grid.map(function(feature){
+    // get current segment (grid cell)
+    var segment = img.clip(feature);
+    // get statistics for current segment
+    var p1 = ee.Number(temp_water.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: feature.geometry(),
+      bestEffort: true,
+      scale: reductionScale
+    }).get(band));
+    var p2 = ee.Number(1).subtract(p1);
+    var m = segment.updateMask(temp_water).rename('m1').addBands(
+      segment.updateMask(temp_water.not()).rename('m2'));
+    var mReduced = m.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: feature.geometry(),
+      bestEffort: true,
+      scale: reductionScale
+    });
+    var m1 = ee.Number(mReduced.get('m1'));
+    var m2 = ee.Number(mReduced.get('m2'));
+    m1 = ee.Number(ee.Algorithms.If(m1, m1, m1_val));
+    m2 = ee.Number(ee.Algorithms.If(m2, m2, m2_val));
+    // use statistics to get Bmax
+    var sigmab = p1.multiply(p2.multiply(m1.subtract(m2).pow(2)));
+    var sigmat = ee.Number(segment.reduceRegion({
+      reducer: ee.Reducer.variance(),
+      geometry: feature.geometry(),
+      bestEffort: true,
+      scale: reductionScale
+    }).get(band));
+    var bmax = sigmab.divide(sigmat);
+    return feature.set({'bmax':bmax});
+  }).filter(ee.Filter.gt('bmax', bmax_thresh));
+  Map.addLayer(bmax, {color:'yellow'}, 'bmax', false);
+  print('Bmax polygons:', bmax.size());
+  return bmax;
+}
+
+function BmaxRandomSelect(bmax, maxN) {
+  // add column with random numbers to bmax features
+  bmax = bmax.randomColumn('random');
+  // use random column for selection
+  var nBoxes = ee.Number(bmax.size());
+  var randomSelection = ee.Number(maxN).divide(nBoxes);
+  var selection = bmax.filter(ee.Filter.lt('random', randomSelection));
+  Map.addLayer(selection, {color:'red'}, 'bmax selection', false);
+  // print('Bmax random selection:', selection);
+  print('Bmax random selection:', selection.size());
+  return selection;
+}
+
+function BmaxOtsu(img) {
+  // get Bmax polygons
+  var bmax = BmaxPolygons(img);
+  // get random selection of Bmax polygons
+  var selection = BmaxRandomSelect(bmax, maxN);
+  // var selection = bmax; // for when you don't want any random selection
+  // get histogram for Otsu
+  var histogram = ee.Dictionary(img.reduceRegion({
+    // reducer: ee.Reducer.histogram(maxBuckets, minBucketWidth, maxRaw),
+    reducer: ee.Reducer.histogram(maxBuckets),
+    geometry: selection,
+    scale: reductionScale,
+    bestEffort: true,
+    tileScale: tileScale
+  }).get(band));
+  var threshold = otsu(histogram);
+  showHist(histogram, threshold, method_2_name);
+  print('calculated threshold (' + method_2_name + '):', threshold);
+  return threshold;
+}
+
+function BmaxCannyOtsu(img) {
+  // get Bmax polygons
+  var bmax = BmaxPolygons(img);
+  // get random selection of Bmax polygons
+  var selection = BmaxRandomSelect(bmax, maxN);
+  // var selection = bmax; // for when you don't want any random selection
+  // get preliminary water
+  var binary = img.lt(initThresh).rename('binary');
+  // get canny edges
+  var canny = ee.Algorithms.CannyEdgeDetector(binary, canny_threshold, canny_sigma);
+  // process canny edges
+  var connected  = canny.updateMask(canny).lt(canny_lt).connectedPixelCount(connected_pixels, true);
+  var edges      = connected.gte(edge_length);
+  edges          = edges.updateMask(edges);
+  var edgeBuffer = edges.focal_max(smooth_edges, 'square', 'meters');
+  // get histogram for Otsu
+  var histogram_image = img.updateMask(edgeBuffer);
+  Map.addLayer(histogram_image, {}, "histogram_image")
+  var histogram = ee.Dictionary(histogram_image.reduceRegion({
+    // reducer: ee.Reducer.histogram(maxBuckets, minBucketWidth, maxRaw),
+    reducer: ee.Reducer.histogram(maxBuckets),
+    geometry: selection,
+    scale: reductionScale,
+    bestEffort: true,
+    tileScale: tileScale
+  }).get(band));
+  var threshold = otsu(histogram);
+  showHist(histogram, threshold, method_3_name);
+  print('calculated threshold (' + method_3_name + '):', threshold);
+  return threshold;
+}
+
+// ----------------------------------------------------------------------------------------- //
+// Otsu thresholding
+// ----------------------------------------------------------------------------------------- //
+
+// method 1
+var S1_thresh_1 = globalOtsu(S1_img);
+// S1_thresh_1     = S1_thresh_1.min(maxThresh);
+var S1_water_1  = S1_img.lt(S1_thresh_1);
+
+// method 2
+var S1_thresh_2 = BmaxOtsu(S1_img);
+// S1_thresh_2     = S1_thresh_2.min(maxThresh);
+var S1_water_2  = S1_img.lt(S1_thresh_2);
+
+// method 3
+// var S1_thresh_3 = BmaxCannyOtsu(img);
+// S1_thresh_3     = S1_thresh_3.min(maxThresh);
+// var S1_water_3  = S1_img.lt(S1_thresh_3);
+
+// ----------------------------------------------------------------------------------------- //
+// Map
+// ----------------------------------------------------------------------------------------- //
+
+Map.centerObject(S1);
+
+Map.addLayer(S1_water_1, visParams_water, 'water (method 1)', false);
+Map.addLayer(S1_water_2, visParams_water, 'water (method 2)', false);
+// Map.addLayer(S1_water_3, visParams_water, 'water (method 3)', false);
+
+/////////////////////
+
+var waterunmasked1 = S1_water_1.updateMask(S1_water_1)
+Map.addLayer(waterunmasked1, visParams_water, 'waterunmasked1 (method 1, masked)');
+
+var waterunmasked2 = S1_water_2.updateMask(S1_water_2)
+Map.addLayer(waterunmasked2, visParams_water, 'waterunmasked1 (method 1, masked)', false);
+
+////////////////////orginal code 
+// Map.addLayer(S1_water_1.updateMask(S1_water_1), visParams_water, 'water (method 1, masked)', false);
+// Map.addLayer(S1_water_2.updateMask(S1_water_2), visParams_water, 'water (method 2, masked)', false);
+// // Map.addLayer(S1_water_3.updateMask(S1_water_3), visParams_water, 'water (method 3, masked)', false);
+
+Map.addLayer(ee.Image().byte().paint(Myanmar, 0, 2), {}, 'Myanmar', false);
+
+
+
+/////////////////////////////////////////////////////////////////////////////Export
+// var asset_dir = 'users/arjenhaag/SERVIR-Mekong/NRT_floods';
+//var asset_dir = 'projects/servir-mekong/hydrafloods/use_cases/hydra_extents';
+var asset_dir = 'projects/servir-mekong/hydrafloods/use_cases/testing/HydraFloods_Eval/Arjens_Method';
+var asset_name_thresh = 'sentinel1_thresholds_';
+var asset_name_extent = 'sentinel1_bootstrapOtsu_Arjens_Method_';
+
+//export region
+var export_region = Myanmar.geometry().bounds();
+
+// export water image to asset
+var asset_name = asset_name_extent + date_1.replace('-','').replace('-','');
+print("asset_name", asset_name)
+var asset_id   = asset_dir + '/' + asset_name;
+print("asset_id", asset_id)
+// print('asset name (water):', asset_name);
+
+
+Export.image.toAsset({
+  image: waterunmasked1, //.set({'sensor': 'sentinel1' , 'system:time_start': ee.Date(target_date).millis()}),
+  description: asset_name,
+  assetId: asset_id,
+  // pyramidingPolicy: ,
+  // dimensions: ,
+  region: export_region,
+  scale: 10,
+  // crs: ,
+  // crsTransform: ,
+  maxPixels: 1e13
+});
